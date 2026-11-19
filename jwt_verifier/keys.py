@@ -1,4 +1,4 @@
-"""Contract-only stubs for the HS256 JWT verifier.
+"""HS256 JWT verifier with multi-key rotation support.
 
 The whole exercise uses one compact token format and one key format:
 
@@ -21,143 +21,238 @@ The whole exercise uses one compact token format and one key format:
 * All times (``now``, ``exp``, ``nbf``, ``iat``, ``retired_at``, ``leeway``,
   ``max_age``) are integer/float seconds since the Unix epoch.  The default
   clock skew allowance is 60 seconds.
-* Invalid input is always reported by raising ``InvalidToken``; the stubs
-  below raise ``NotImplementedError`` because the implementation is the
-  task.
+* Invalid input is always reported by raising ``InvalidToken``.
 """
+
+import base64
+import hashlib
+import hmac
+import json
+import math
+import re
 
 
 class InvalidToken(Exception):
     """Raised whenever a token, header, key or claim fails validation."""
 
 
+_B64URL_RE = re.compile(r"[A-Za-z0-9_-]*")
+_KID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_HEX_RE = re.compile(r"[0-9a-fA-F]+")
+
+_SUPPORTED_ALG = "HS256"
+
+
 def b64url_decode(s: str) -> bytes:
-    """Strictly decode an unpadded base64url string into bytes.
+    """Strictly decode an unpadded base64url string into bytes."""
+    if not isinstance(s, str):
+        raise InvalidToken("base64url input must be a string")
+    if not _B64URL_RE.fullmatch(s):
+        raise InvalidToken("illegal base64url character")
+    if len(s) % 4 == 1:
+        raise InvalidToken("impossible base64url length")
+    padded = s + "=" * (-len(s) % 4)
+    try:
+        return base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+    except Exception as exc:
+        raise InvalidToken("invalid base64url encoding") from exc
 
-    Contract:
-    - Only ``A-Z``, ``a-z``, ``0-9``, ``-`` and ``_`` are legal.
-    - ``=`` padding, whitespace (spaces, tabs, newlines) and every other
-      character are rejected.
-    - The number of characters must form a valid base64url payload; an
-      impossible length is rejected.
-    - Empty input is legal and decodes to ``b""``.
-    - Raise ``InvalidToken`` for any violation; return the decoded bytes.
-    """
 
-    raise NotImplementedError
+def _is_number(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _require_number(value, what: str) -> float:
+    if not _is_number(value):
+        raise InvalidToken(f"{what} must be a finite number")
+    return value
 
 
 def select_key(header: dict, jwks: dict) -> dict:
-    """Select exactly one HS256 key for a decoded JWT header.
+    """Select exactly one HS256 key for a decoded JWT header."""
+    if not isinstance(header, dict):
+        raise InvalidToken("header must be a JSON object")
+    alg = header.get("alg")
+    if not isinstance(alg, str) or not alg:
+        raise InvalidToken("header must declare an alg")
+    if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+        raise InvalidToken("jwks must contain a keys list")
+    keys = jwks["keys"]
 
-    Contract:
-    - ``header`` must be a dict containing ``alg``; ``jwks`` must be a dict
-      containing a list under ``"keys"``.
-    - If ``header`` has a ``kid``, it must be a string that fully matches
-      ``^[A-Za-z0-9._-]{1,64}$``.  An invalid ``kid`` is rejected *before*
-      any lookup, so path separators and control characters can never be
-      used for injection.  Exactly one key with that exact ``kid`` must
-      exist; zero or duplicate matches are rejected.
-    - If ``header`` has no ``kid``, selection is allowed only when
-      ``jwks["keys"]`` contains exactly one key.  Never fall back to the
-      first key when several keys are present.
-    - The selected key must be an octet key (``kty == "oct"``), must declare
-      the same ``alg`` as the header, and must contain a non-empty,
-      even-length hexadecimal ``secret``.  This binds the declared algorithm
-      to the key type and forbids HS/RS confusion: an ``RS256`` header can
-      never be paired with an HS256 key, and a key declaring another
-      algorithm is never accepted.
-    - Raise ``InvalidToken`` on every violation; return the selected key
-      dict unchanged.
-    """
+    if "kid" in header:
+        kid = header["kid"]
+        # Validate before any lookup: no path separators, no control chars.
+        if not isinstance(kid, str) or not _KID_RE.fullmatch(kid):
+            raise InvalidToken("kid fails the character/length policy")
+        matches = [k for k in keys if isinstance(k, dict) and k.get("kid") == kid]
+        if len(matches) != 1:
+            raise InvalidToken("kid must match exactly one key")
+        key = matches[0]
+    else:
+        # No kid: only an unambiguous single-key JWKS is acceptable.
+        if len(keys) != 1 or not isinstance(keys[0], dict):
+            raise InvalidToken("no kid and the JWKS does not hold exactly one key")
+        key = keys[0]
 
-    raise NotImplementedError
+    # Bind the declared algorithm to the key type and the key's own alg.
+    if key.get("kty") != "oct":
+        raise InvalidToken("key type does not match the algorithm")
+    if key.get("alg") != alg:
+        raise InvalidToken("key alg does not match the header alg")
+    secret = key.get("secret")
+    if (
+        not isinstance(secret, str)
+        or not secret
+        or len(secret) % 2 != 0
+        or not _HEX_RE.fullmatch(secret)
+    ):
+        raise InvalidToken("secret must be non-empty even-length hex")
+    return key
+
+
+def _reject_duplicate_keys(pairs: list) -> dict:
+    obj = {}
+    for name, value in pairs:
+        if name in obj:
+            raise InvalidToken(f"duplicate JSON key: {name!r}")
+        obj[name] = value
+    return obj
+
+
+def _json_object(raw: bytes, what: str) -> dict:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidToken(f"{what} is not valid UTF-8") from exc
+    try:
+        value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except InvalidToken:
+        raise
+    except Exception as exc:
+        raise InvalidToken(f"{what} is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise InvalidToken(f"{what} must be a JSON object")
+    return value
+
+
+def _parse_token(token: str):
+    """Split and decode a token into (header, payload, signing_input, signature)."""
+    if not isinstance(token, str):
+        raise InvalidToken("token must be a string")
+    parts = token.split(".")
+    if len(parts) != 3 or any(part == "" for part in parts):
+        raise InvalidToken("token must have exactly three non-empty segments")
+    header_segment, payload_segment, signature_segment = parts
+    header = _json_object(b64url_decode(header_segment), "header")
+    payload = _json_object(b64url_decode(payload_segment), "payload")
+    signature = b64url_decode(signature_segment)
+    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
+    return header, payload, signing_input, signature
+
+
+def _signature_matches(key: dict, signing_input: bytes, signature: bytes) -> bool:
+    secret = bytes.fromhex(key["secret"])
+    expected = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, signature)
 
 
 def decode(token: str, jwks: dict, now: float, leeway: int = 60) -> dict:
-    """Decode, authenticate and validate one HS256 JWT.
+    """Decode, authenticate and validate one HS256 JWT."""
+    header, payload, signing_input, signature = _parse_token(token)
 
-    Contract:
-    - ``token`` must be a string with exactly three dot-separated, non-empty
-      segments (``header.payload.signature``).  Extra or missing dots are
-      rejected.
-    - Decode all three segments with :func:`b64url_decode`; padding,
-      whitespace and illegal base64url characters are rejected rather than
-      ignored.
-    - The header must be a JSON object.  ``alg`` is taken from that object
-      but is accepted only when it is exactly ``"HS256"``.  ``"none"`` and
-      every other algorithm are rejected before key selection or signature
-      processing.
-    - Select the key with :func:`select_key`, including its ``kid`` and
-      algorithm/key-type binding rules.
-    - Recompute ``HMAC-SHA256(secret, header_segment + "." + payload_segment)``
-      over the ASCII segments and compare it to the decoded signature in
-      constant time.  A missing, truncated, empty or wrong signature is
-      rejected.
-    - The payload must be a JSON object.  Duplicate top-level claim names in
-      the payload JSON are rejected; last-one-wins parsing is forbidden.
-      Arrays and scalar JSON values are rejected.
-    - Validate time claims by calling
-      ``check_claims(payload, now, leeway)``; the default ``max_age`` of
-      3600 seconds applies.
-    - Return the payload dict; raise ``InvalidToken`` on any failure.
-    """
+    # alg whitelist: only HS256, decided by us -- never trust "none" or
+    # let an RS256 header be paired with an HMAC key.
+    if header.get("alg") != _SUPPORTED_ALG:
+        raise InvalidToken("unsupported or missing alg")
 
-    raise NotImplementedError
+    key = select_key(header, jwks)
+    if not _signature_matches(key, signing_input, signature):
+        raise InvalidToken("signature verification failed")
+
+    check_claims(payload, now, leeway)
+    return payload
 
 
-def check_claims(payload: dict, now: float, leeway: int = 60, max_age: int = 3600) -> None:
-    """Validate the time claims of an already-decoded JWT payload.
+def check_claims(
+    payload: dict, now: float, leeway: int = 60, max_age: int = 3600
+) -> None:
+    """Validate the time claims of an already-decoded JWT payload."""
+    if not isinstance(payload, dict):
+        raise InvalidToken("payload must be a JSON object")
+    _require_number(now, "now")
+    leeway = _require_number(leeway, "leeway")
+    max_age = _require_number(max_age, "max_age")
+    if leeway < 0 or max_age < 0:
+        raise InvalidToken("leeway and max_age must be non-negative")
 
-    All values are seconds.  ``leeway`` and ``max_age`` must be
-    non-negative numbers.
+    if "exp" not in payload:
+        raise InvalidToken("exp is required")
+    if "iat" not in payload:
+        raise InvalidToken("iat is required")
+    exp = _require_number(payload["exp"], "exp")
+    iat = _require_number(payload["iat"], "iat")
+    nbf = None
+    if "nbf" in payload:
+        nbf = _require_number(payload["nbf"], "nbf")
 
-    Contract:
-    - ``payload`` must be a dict.  ``exp`` and ``iat`` must be present and
-      numeric; booleans, strings, ``NaN`` and infinities are rejected.
-      ``nbf`` is optional but must be numeric when present.
-    - Expiry: ``now <= exp + leeway``.  A token exactly on the leeway
-      boundary is accepted; one second beyond it is rejected.
-    - Not-before: when ``nbf`` is present, ``nbf - leeway <= now``.
-    - Issued-at: ``iat <= now + leeway`` (a small future clock skew is
-      tolerated, a larger one is rejected) and ``now - iat <= max_age``
-      (stale tokens are rejected).
-    - Also reject an inconsistent interval where ``exp < nbf`` or
-      ``exp < iat``.
-    - Return ``None`` on success; raise ``InvalidToken`` on any violation.
-    """
-
-    raise NotImplementedError
+    # Expiry: accepted exactly on the leeway boundary, rejected beyond it.
+    if not now <= exp + leeway:
+        raise InvalidToken("token has expired")
+    # Not-before.
+    if nbf is not None and not nbf - leeway <= now:
+        raise InvalidToken("token is not yet valid")
+    # Issued-at: tolerate small future skew, reject stale tokens.
+    if not iat <= now + leeway:
+        raise InvalidToken("iat is too far in the future")
+    if not now - iat <= max_age:
+        raise InvalidToken("token is older than max_age")
+    # Internally inconsistent validity interval.
+    if nbf is not None and exp < nbf:
+        raise InvalidToken("exp precedes nbf")
+    if exp < iat:
+        raise InvalidToken("exp precedes iat")
 
 
 def verify_with_rotation(token: str, jwks_versions: list[dict], now: float) -> dict:
-    """Verify a token across rotated JWKS versions and enforce retirement.
+    """Verify a token across rotated JWKS versions and enforce retirement."""
+    if not isinstance(jwks_versions, list) or not jwks_versions:
+        raise InvalidToken("jwks_versions must be a non-empty list")
 
-    ``jwks_versions`` is a non-empty list with the newest JWKS first; the
-    current version is ``jwks_versions[0]``.  Every item has the JWKS shape
-    documented at module level.  A key may carry ``"retired": false`` (the
-    default) or ``"retired": true`` together with a numeric ``"retired_at"``
-    epoch timestamp.
+    header, payload, signing_input, signature = _parse_token(token)
+    if header.get("alg") != _SUPPORTED_ALG:
+        raise InvalidToken("unsupported or missing alg")
 
-    Contract:
-    - Try versions from newest to oldest.  A version is a hit when
-      :func:`select_key` finds the matching kid/alg key and the HS256
-      signature verifies against that key.
-    - After a hit, the same kid must still be present in the current
-      (newest) version.  If its current ``retired`` flag is false, the token
-      is accepted.  If it is true, the token is accepted only when the
-      payload contains a numeric ``iat`` with ``iat <= retired_at``.  A
-      retired key therefore can never authenticate a token issued after its
-      retirement time.
-    - An older version being active must never override the current
-      version's retired status.  Likewise, when the current key is active,
-      a signature produced by an older key with the same kid is rejected.
-    - Apply full :func:`decode` validation (including leeway, duplicate
-      claims and ``max_age``) to the accepted version and return its
-      payload.
-    - Raise ``InvalidToken`` when no version verifies, when the kid is no
-      longer present in the current version, or when the retirement rule is
-      violated.
-    """
+    # Newest to oldest: a version is a hit when its key verifies the signature.
+    hit_version = None
+    for version in jwks_versions:
+        try:
+            key = select_key(header, version)
+        except InvalidToken:
+            continue
+        if _signature_matches(key, signing_input, signature):
+            hit_version = version
+            break
+    if hit_version is None:
+        raise InvalidToken("no JWKS version verifies the token")
 
-    raise NotImplementedError
+    # The retirement status of the CURRENT version always wins.
+    current_key = select_key(header, jwks_versions[0])
+    if current_key.get("retired", False):
+        retired_at = current_key.get("retired_at")
+        if not _is_number(retired_at):
+            raise InvalidToken("retired key lacks a numeric retired_at")
+        iat = payload.get("iat")
+        if not _is_number(iat) or not iat <= retired_at:
+            raise InvalidToken("retired key cannot authenticate a newer token")
+    else:
+        # The current key is active: the signature must verify against it,
+        # not merely against an older key that shares the kid.
+        if not _signature_matches(current_key, signing_input, signature):
+            raise InvalidToken("signature does not match the current key")
+
+    # Full validation (leeway, duplicate claims, max_age) on the hit version.
+    return decode(token, hit_version, now)
